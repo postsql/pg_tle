@@ -4976,7 +4976,7 @@ pg_tle_install_extension(PG_FUNCTION_ARGS)
 
 	sql_str = text_to_cstring(PG_GETARG_TEXT_PP(3));
 
-	if (PG_ARGISNULL(4) || !PG_GETARG_DATUM(4))
+	if (PG_NARGS() < 5 || PG_ARGISNULL(4) || !PG_GETARG_DATUM(4))
 		reqlist = NIL;
 	else
 	{
@@ -4985,7 +4985,7 @@ pg_tle_install_extension(PG_FUNCTION_ARGS)
 		check_requires_list(reqlist);
 	}
 
-	if (PG_ARGISNULL(5) || !PG_GETARG_DATUM(5))
+	if (PG_NARGS() < 6 || PG_ARGISNULL(5) || !PG_GETARG_DATUM(5))
 		extschema = NULL;
 	else
 	{
