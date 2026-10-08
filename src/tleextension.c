@@ -63,6 +63,7 @@
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "commands/proclang.h"
 #include "commands/schemacmds.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -602,6 +603,26 @@ pg_tle_get_extension_control_directory(void)
 	char		sharepath[MAXPGPATH];
 	char	   *result;
 
+#if PG_VERSION_NUM >= 180000
+	if (creating_extension && OidIsValid(CurrentExtensionObject))
+	{
+		char *extname = get_extension_name(CurrentExtensionObject);
+		if (extname)
+		{
+			char *ctrlfile = get_extension_control_filename_for_file(extname);
+			if (filestat(ctrlfile))
+			{
+				char *slash = strrchr(ctrlfile, '/');
+				if (slash)
+				{
+					*slash = '\0';
+					return ctrlfile;
+				}
+			}
+		}
+	}
+#endif
+
 	get_share_path(my_exec_path, sharepath);
 	result = (char *) palloc(MAXPGPATH);
 	snprintf(result, MAXPGPATH, "%s/extension", sharepath);
@@ -632,6 +653,38 @@ get_extension_control_filename_for_file(const char *extname)
 	result = (char *) palloc(MAXPGPATH);
 	snprintf(result, MAXPGPATH, "%s/extension/%s.control",
 			 sharepath, extname);
+
+	if (filestat(result))
+		return result;
+
+#if PG_VERSION_NUM >= 180000
+	if (Extension_control_path && Extension_control_path[0] != '\0')
+	{
+		char *ecp = pstrdup(Extension_control_path);
+		char *piece;
+		char *next;
+
+		for (piece = ecp; piece && *piece; piece = next)
+		{
+			char candidate[MAXPGPATH];
+			next = strchr(piece, ':');
+			if (next)
+				*next++ = '\0';
+
+			if (strcmp(piece, "$system") == 0)
+				continue;
+
+			snprintf(candidate, MAXPGPATH, "%s/extension/%s.control", piece, extname);
+			if (filestat(candidate))
+			{
+				pfree(result);
+				pfree(ecp);
+				return pstrdup(candidate);
+			}
+		}
+		pfree(ecp);
+	}
+#endif
 
 	return result;
 }
@@ -1201,6 +1254,9 @@ execute_sql_string(const char *sql)
 
 				qdesc = CreateQueryDesc(stmt,
 										sql,
+#ifdef SPECKLE_POSTGRES
+										CreateCommandTag((Node *) stmt), NULL,
+#endif
 										GetActiveSnapshot(), NULL,
 										dest, NULL, NULL, 0);
 
@@ -4146,6 +4202,216 @@ pg_tle_xact_callback(XactEvent event, void *arg)
 	UNSET_TLEEXT;
 }
 
+/*
+ * check_is_pgtle_admin
+ *
+ * Verifies that the current user has permissions of the pgtle_admin role.
+ */
+void
+check_is_pgtle_admin(void)
+{
+	Oid			tleadminoid;
+
+	tleadminoid = get_role_oid(PG_TLE_ADMIN, false);
+	CHECK_CAN_SET_ROLE(GetUserId(), tleadminoid);
+}
+
+/*
+ * pgtle_is_trusted_plang_allowed
+ *
+ * Checks if a non-superuser is permitted to create a procedural language.
+ * Allowed only if:
+ * 1. Current user is a member of pgtle_admin.
+ * 2. The language is declared TRUSTED (stmt->pltrusted == true).
+ * 3. The handler function returns type language_handler.
+ * 4. The handler function is written in a trusted procedural language
+ *    (lanpltrusted == true, lanispl == true, not C or internal).
+ * 5. Optional inline/validator functions are also in trusted procedural languages.
+ */
+static bool
+pgtle_is_trusted_plang_allowed(CreatePLangStmt *stmt)
+{
+	Oid			handlerOid;
+	Oid			funcrettype;
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	Oid			proclang;
+	HeapTuple	langtup;
+	Form_pg_language langform;
+	bool		lanpltrusted;
+	bool		lanispl;
+
+	if (superuser())
+		return false;	/* superuser doesn't need elevation */
+
+	/* 1. Must be pgtle_admin */
+	check_is_pgtle_admin();
+
+	/* 2. Only TRUSTED languages allowed */
+	if (!stmt->pltrusted)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("only TRUSTED procedural languages can be created by non-superusers")));
+
+	/* 3. Lookup handler function */
+	if (!stmt->plhandler)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("language handler function must be specified")));
+
+	handlerOid = LookupFuncName(stmt->plhandler, 0, NULL, false);
+	funcrettype = get_func_rettype(handlerOid);
+	if (funcrettype != LANGUAGE_HANDLEROID)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("function %s must return type language_handler",
+						NameListToString(stmt->plhandler))));
+
+	/* 4. Verify handler's language is a trusted PL */
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(handlerOid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", handlerOid);
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+	proclang = procform->prolang;
+	ReleaseSysCache(proctup);
+
+	langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(proclang));
+	if (!HeapTupleIsValid(langtup))
+		elog(ERROR, "cache lookup failed for language %u", proclang);
+	langform = (Form_pg_language) GETSTRUCT(langtup);
+	lanpltrusted = langform->lanpltrusted;
+	lanispl = langform->lanispl;
+	ReleaseSysCache(langtup);
+
+	if (!lanpltrusted || !lanispl || proclang == ClanguageId || proclang == INTERNALlanguageId)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("handler function %s must be written in a trusted procedural language (cannot be C, internal, or untrusted)",
+						NameListToString(stmt->plhandler))));
+
+	/* 5. Check inline function if present */
+	if (stmt->plinline)
+	{
+		Oid			funcargtypes[1] = {INTERNALOID};
+		Oid			inlineOid;
+
+		inlineOid = LookupFuncName(stmt->plinline, 1, funcargtypes, false);
+
+		proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(inlineOid));
+		if (!HeapTupleIsValid(proctup))
+			elog(ERROR, "cache lookup failed for function %u", inlineOid);
+		procform = (Form_pg_proc) GETSTRUCT(proctup);
+		proclang = procform->prolang;
+		ReleaseSysCache(proctup);
+
+		langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(proclang));
+		if (!HeapTupleIsValid(langtup))
+			elog(ERROR, "cache lookup failed for language %u", proclang);
+		langform = (Form_pg_language) GETSTRUCT(langtup);
+		lanpltrusted = langform->lanpltrusted;
+		lanispl = langform->lanispl;
+		ReleaseSysCache(langtup);
+
+		if (!lanpltrusted || !lanispl || proclang == ClanguageId || proclang == INTERNALlanguageId)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("inline function %s must be written in a trusted procedural language",
+							NameListToString(stmt->plinline))));
+	}
+
+	/* 6. Check validator function if present */
+	if (stmt->plvalidator)
+	{
+		Oid			funcargtypes[1] = {OIDOID};
+		Oid			valOid;
+		Oid			valrettype;
+
+		valOid = LookupFuncName(stmt->plvalidator, 1, funcargtypes, false);
+		valrettype = get_func_rettype(valOid);
+		if (valrettype != VOIDOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("validator function %s must return type void",
+							NameListToString(stmt->plvalidator))));
+
+		proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(valOid));
+		if (!HeapTupleIsValid(proctup))
+			elog(ERROR, "cache lookup failed for function %u", valOid);
+		procform = (Form_pg_proc) GETSTRUCT(proctup);
+		proclang = procform->prolang;
+		ReleaseSysCache(proctup);
+
+		langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(proclang));
+		if (!HeapTupleIsValid(langtup))
+			elog(ERROR, "cache lookup failed for language %u", proclang);
+		langform = (Form_pg_language) GETSTRUCT(langtup);
+		lanpltrusted = langform->lanpltrusted;
+		lanispl = langform->lanispl;
+		ReleaseSysCache(langtup);
+
+		if (!lanpltrusted || !lanispl || proclang == ClanguageId || proclang == INTERNALlanguageId)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("validator function %s must be written in a trusted procedural language",
+							NameListToString(stmt->plvalidator))));
+	}
+
+	return true;
+}
+
+/*
+ * pgtle_is_trusted_plang_drop_allowed
+ *
+ * Checks if a non-superuser is permitted to drop a procedural language.
+ */
+static bool
+pgtle_is_trusted_plang_drop_allowed(DropStmt *stmt)
+{
+	ListCell   *lc;
+
+	Assert(stmt->removeType == OBJECT_LANGUAGE);
+
+	if (superuser())
+		return false;	/* superuser doesn't need elevation */
+
+	check_is_pgtle_admin();
+
+	foreach(lc, stmt->objects)
+	{
+		Node	   *obj = (Node *) lfirst(lc);
+		char	   *langname = strVal(obj);
+		Oid			langOid = get_language_oid(langname, true);
+		HeapTuple	langtup;
+
+		if (!OidIsValid(langOid))
+			continue;
+
+		/* Verify language is a trusted PL, and not a system language */
+		langtup = SearchSysCache1(LANGOID, ObjectIdGetDatum(langOid));
+		if (HeapTupleIsValid(langtup))
+		{
+			Form_pg_language langform = (Form_pg_language) GETSTRUCT(langtup);
+			bool lanpltrusted = langform->lanpltrusted;
+			bool lanispl = langform->lanispl;
+			ReleaseSysCache(langtup);
+
+			if (!lanpltrusted || !lanispl ||
+				strcmp(langname, "c") == 0 ||
+				strcmp(langname, "internal") == 0 ||
+				strcmp(langname, "sql") == 0 ||
+				strcmp(langname, "plpgsql") == 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("language \"%s\" cannot be dropped by non-superusers",
+								langname)));
+			}
+		}
+	}
+
+	return true;
+}
+
 void
 pg_tle_init(void)
 {
@@ -4540,6 +4806,78 @@ _PU_HOOK
 												 &relation,
 												 AccessExclusiveLock, false);
 					check_pgtle_used_func(address.objectId);
+				}
+				break;
+			}
+
+		case T_CreatePLangStmt:
+			{
+				CreatePLangStmt *stmt = (CreatePLangStmt *) pu_parsetree;
+
+				if (!IsBinaryUpgrade && !superuser() && pgtle_is_trusted_plang_allowed(stmt))
+				{
+					Oid			save_userid;
+					int			save_sec_context;
+
+					GetUserIdAndSecContext(&save_userid, &save_sec_context);
+					SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+										   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+
+					PG_TRY();
+					{
+						if (prev_hook)
+						{
+							_prev_hook;
+						}
+						else
+						{
+							_standard_ProcessUtility;
+						}
+					}
+					PG_FINALLY();
+					{
+						SetUserIdAndSecContext(save_userid, save_sec_context);
+					}
+					PG_END_TRY();
+
+					cmd_done = true;
+				}
+				break;
+			}
+
+		case T_DropStmt:
+			{
+				DropStmt   *stmt = (DropStmt *) pu_parsetree;
+
+				if (!IsBinaryUpgrade && !superuser() &&
+					stmt->removeType == OBJECT_LANGUAGE &&
+					pgtle_is_trusted_plang_drop_allowed(stmt))
+				{
+					Oid			save_userid;
+					int			save_sec_context;
+
+					GetUserIdAndSecContext(&save_userid, &save_sec_context);
+					SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
+										   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+
+					PG_TRY();
+					{
+						if (prev_hook)
+						{
+							_prev_hook;
+						}
+						else
+						{
+							_standard_ProcessUtility;
+						}
+					}
+					PG_FINALLY();
+					{
+						SetUserIdAndSecContext(save_userid, save_sec_context);
+					}
+					PG_END_TRY();
+
+					cmd_done = true;
 				}
 				break;
 			}

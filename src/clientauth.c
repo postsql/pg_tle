@@ -329,6 +329,7 @@ clientauth_init(void)
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = clientauth_shmem_startup;
 
+	memset(&worker, 0, sizeof(BackgroundWorker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = 1;
