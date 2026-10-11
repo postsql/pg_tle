@@ -146,10 +146,22 @@ class TestStandaloneTools(unittest.TestCase):
 
   def test_resolve_default_psql_bin(self) -> None:
     orig_env = os.environ.get("TLE_PACK_PSQL")
+    orig_pg_cfg = os.environ.get("PG_CONFIG")
     try:
       os.environ["TLE_PACK_PSQL"] = "/custom/path/to/psql"
       self.assertEqual(tle_pack.resolve_default_psql_bin(), "/custom/path/to/psql")
       del os.environ["TLE_PACK_PSQL"]
+      with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        mock_pg_cfg = tmp_path / "pg_config"
+        mock_psql = tmp_path / "psql"
+        mock_psql.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        mock_psql.chmod(0o755)
+        mock_pg_cfg.write_text(f"#!/bin/sh\necho '{tmp_path}'\n", encoding="utf-8")
+        mock_pg_cfg.chmod(0o755)
+        os.environ["PG_CONFIG"] = str(mock_pg_cfg)
+        self.assertEqual(tle_pack.resolve_default_psql_bin(), str(mock_psql))
+      os.environ.pop("PG_CONFIG", None)
       resolved = tle_pack.resolve_default_psql_bin()
       self.assertTrue(resolved.endswith("psql"))
       self.assertNotIn("/usr/local/google/home/", resolved)
@@ -158,6 +170,10 @@ class TestStandaloneTools(unittest.TestCase):
         os.environ["TLE_PACK_PSQL"] = orig_env
       else:
         os.environ.pop("TLE_PACK_PSQL", None)
+      if orig_pg_cfg is not None:
+        os.environ["PG_CONFIG"] = orig_pg_cfg
+      else:
+        os.environ.pop("PG_CONFIG", None)
 
   def test_tle_pack_js_package_and_comment_safety(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -900,9 +916,52 @@ class TestStandaloneTools(unittest.TestCase):
             capture_output=True,
         )
 
-        # Execute all 3 SQL bundles and verify UDF execution in PostgreSQL
+        # 3b. Test CommonJS package with --compile-bytecode
+        cjs_pkg = tmp_path / "cjs_pkg"
+        cjs_pkg.mkdir()
+        (cjs_pkg / "package.json").write_text(
+            json.dumps({
+                "name": "e2e_cjs_pkg",
+                "version": "1.0.0",
+                "main": "index.cjs",
+                "pgtle": {
+                    "functions": [
+                        {
+                            "name": "e2e_cjs_quad",
+                            "export": "quad",
+                            "args": [{"name": "x", "type": "int4"}],
+                            "returns": "int4",
+                        }
+                    ]
+                },
+            }),
+            encoding="utf-8",
+        )
+        (cjs_pkg / "index.cjs").write_text(
+            "exports.quad = function(x) { return x * 4; };\n",
+            encoding="utf-8",
+        )
+        cjs_sql = tmp_path / "e2e_cjs.sql"
+        subprocess.run(
+            [
+                str(tle_pyz),
+                "js",
+                str(cjs_pkg),
+                "--as-extension",
+                "--compile-bytecode",
+                "--dsn",
+                dsn,
+                "-o",
+                str(cjs_sql),
+            ],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+
+        # Execute all 4 SQL bundles and verify UDF execution in PostgreSQL
         psql_bin = str(bindir / "psql")
-        for sql_file in (js_sql, wasm_sql, wbg_sql):
+        for sql_file in (js_sql, cjs_sql, wasm_sql, wbg_sql):
           subprocess.run(
               [psql_bin, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", dsn, "-f", str(sql_file)],
               check=True,
@@ -921,13 +980,13 @@ class TestStandaloneTools(unittest.TestCase):
                 "-d",
                 dsn,
                 "-c",
-                "SELECT e2e_js_triple(14), add_i32(20, 22), mul_i64(6, 7), checked_divide(84, 2);",
+                "SELECT e2e_js_triple(14), e2e_cjs_quad(10), add_i32(20, 22), mul_i64(6, 7), checked_divide(84, 2);",
             ],
             check=True,
             capture_output=True,
             text=True,
         )
-        self.assertEqual(verify_res.stdout.strip(), "42|42|42|42")
+        self.assertEqual(verify_res.stdout.strip(), "42|40|42|42|42")
 
         # 4. If Go compiler is available, compile a real Go wasip1 `.wasm` reactor binary,
         #    package it with tle-pack.pyz wasm, and execute it inside PostgreSQL!

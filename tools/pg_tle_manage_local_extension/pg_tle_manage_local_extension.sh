@@ -21,10 +21,10 @@ PROGRAM_VERSION="1.1"
 
 if [ -n "${TLE_PACK_PSQL:-}" ]; then
   PGCLI="${TLE_PACK_PSQL}"
-elif command -v psql >/dev/null 2>&1; then
-  PGCLI="$(command -v psql)"
 elif [ -n "${PG_CONFIG:-}" ] && [ -x "$(${PG_CONFIG} --bindir 2>/dev/null)/psql" ]; then
   PGCLI="$(${PG_CONFIG} --bindir)/psql"
+elif command -v psql >/dev/null 2>&1; then
+  PGCLI="$(command -v psql)"
 elif command -v pg_config >/dev/null 2>&1 && [ -x "$(pg_config --bindir 2>/dev/null)/psql" ]; then
   PGCLI="$(pg_config --bindir)/psql"
 else
@@ -291,19 +291,25 @@ case "$Action" in
         fi
         SUFLAG="$(sed -ne "s/ //g;s/^trusted=\(.*\)/\1/p" < ${ExtControl})"
         SUFLAG=${SUFLAG:-false}
+        REQUIRES_RAW="$(sed -ne "s/ //g;s/^requires='\(.*\)'/\1/p" < ${ExtControl})"
+        if [ -n "${REQUIRES_RAW}" ]; then
+          REQUIRES_SQL="pg_catalog.string_to_array('${REQUIRES_RAW}', ',')"
+        else
+          REQUIRES_SQL="NULL::text[]"
+        fi
         if [ ${Action} == "update" ]; then
           SQL_WHERE=" WHERE NOT EXISTS (SELECT pg_proc.proname FROM pg_catalog.pg_proc WHERE pg_proc.proname LIKE '${ExtName}.control'::pg_catalog.name AND pg_proc.pronamespace OPERATOR(pg_catalog.=) 'pgtle'::regnamespace::oid)"
         else
           SQL_WHERE=""
         fi
-        SQL_QUERY="SELECT FROM pgtle.install_extension('${ExtName}', '${v1}', '"$(sed -ne "s/^comment.*=.*'\(.*\)'/\1/p" < ${ExtControl})"', \$_PG_TLE_SQL_\$$(cat ${v2})\$_PG_TLE_SQL_\$) ${SQL_WHERE};"
+        SQL_QUERY="CREATE EXTENSION IF NOT EXISTS pg_tle; SELECT FROM pgtle.install_extension('${ExtName}', '${v1}', '"$(sed -ne "s/^comment.*=.*'\(.*\)'/\1/p" < ${ExtControl})"', \$_PG_TLE_SQL_\$$(cat ${v2})\$_PG_TLE_SQL_\$, ${REQUIRES_SQL}) ${SQL_WHERE};"
       else
         if [ ${Action} == "update" ]; then
           SQL_WHERE=" WHERE NOT EXISTS (SELECT pg_proc.proname FROM pg_catalog.pg_proc WHERE pg_proc.proname LIKE '${ExtName}--${v1}--${v2}.sql'::pg_catalog.name AND pg_proc.pronamespace OPERATOR(pg_catalog.=) 'pgtle'::regnamespace::oid)"
         else
           SQL_WHERE=""
         fi
-        SQL_QUERY="SELECT FROM pgtle.install_update_path('${ExtName}', '${v1}', '${v2}', \$_PG_TLE_SQL_\$$(cat ${v3})\$_PG_TLE_SQL_\$) ${SQL_WHERE};"
+        SQL_QUERY="CREATE EXTENSION IF NOT EXISTS pg_tle; SELECT FROM pgtle.install_update_path('${ExtName}', '${v1}', '${v2}', \$_PG_TLE_SQL_\$$(cat ${v3})\$_PG_TLE_SQL_\$) ${SQL_WHERE};"
       fi
       SQL_FILE=$(mktemp .$$.XXXXXXXXXXXXXXXXXXX.sql)
       (echo "\\set ON_ERROR_STOP true";echo "${SQL_QUERY}") >${SQL_FILE}
@@ -327,16 +333,16 @@ case "$Action" in
     fi
     printf "\nRemoving ${ExtName} from ${pgConn}\n"
     PGFLAGS=${PGFLAGS_DML}
-    SQL_QUERY="SELECT FROM pgtle.uninstall_extension('${ExtName}');"
+    SQL_QUERY="CREATE EXTENSION IF NOT EXISTS pg_tle; SELECT FROM pgtle.uninstall_extension('${ExtName}');"
     RUN_PGSQL
     ;;
   list|list-versions)
     printf "\nList pg_tle installed extension(s) from ${pgConn}\n"
     PGFLAGS=${PGFLAGS_QRY}
     if [ $Action = "list" ] ; then
-      SQL_QUERY='SELECT * FROM pgtle.available_extensions();'
+      SQL_QUERY='CREATE EXTENSION IF NOT EXISTS pg_tle; SELECT * FROM pgtle.available_extensions();'
     else
-      SQL_QUERY='SELECT * FROM pgtle.available_extension_versions();'
+      SQL_QUERY='CREATE EXTENSION IF NOT EXISTS pg_tle; SELECT * FROM pgtle.available_extension_versions();'
     fi
     RUN_PGSQL
     ;;

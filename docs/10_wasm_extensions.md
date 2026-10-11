@@ -18,8 +18,8 @@
 
 ## Quick Reference: SQL & CLI Entry Points
 
-1. **`pgtle.install_wasm_extension(name text, version text, description text, wasm_bytes bytea, manifest jsonb DEFAULT NULL, requires text[] DEFAULT '{}')`**:
-   Validates the `.wasm` binary, stores it in `pgtle.modules` and `public.plv8_wasm_modules`, introspects the binary's Type/Function/Export sections (or merges your `manifest`), and registers the TLE extension for `CREATE EXTENSION <name>`.
+1. **`pgtle.install_wasm_extension(name text, version text, description text, wasm_bytes bytea, manifest jsonb DEFAULT NULL, requires text[] DEFAULT NULL, is_trusted boolean DEFAULT true)`**:
+   Validates the `.wasm` binary, stores it in `pgtle.modules`, `plv8.packages` / `plv8.modules` (`entry_point = 'index.wasm'`, `path = 'index.wasm'`), and `public.plv8_wasm_modules`, introspects the binary's Type/Function/Export sections (or merges your `manifest`), and registers the TLE extension for `CREATE EXTENSION <name>`.
 2. **`tle-pack` (`pg_tle/tools/tle-pack wasm <input.wasm> --name <ext> --version <ver> [--manifest manifest.json] [--glue-js glue.js] --output <ext.sql>`)**:
    Packages a `.wasm` binary (and optional `manifest.json` / `wasm-bindgen` JS glue) into a single SQL file calling `pgtle.install_wasm_extension(...)`.
 3. **`pgwasm-pack` (`pg_tle/tools/pgwasm_pack.py` / `pg_tle/tools/pgwasm-pack`)**:

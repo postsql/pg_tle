@@ -59,14 +59,28 @@ def resolve_default_psql_bin() -> str:
   env_psql = os.environ.get("TLE_PACK_PSQL")
   if env_psql:
     return env_psql
+  env_pg_config = os.environ.get("PG_CONFIG")
+  if env_pg_config:
+    try:
+      res = subprocess.run(
+          [env_pg_config, "--bindir"],
+          capture_output=True,
+          text=True,
+          check=True,
+      )
+      candidate = pathlib.Path(res.stdout.strip()) / "psql"
+      if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    except Exception:
+      pass
   which_psql = shutil.which("psql")
   if which_psql:
     return which_psql
-  pg_config = os.environ.get("PG_CONFIG") or shutil.which("pg_config")
-  if pg_config:
+  which_pg_config = shutil.which("pg_config")
+  if which_pg_config:
     try:
       res = subprocess.run(
-          [pg_config, "--bindir"],
+          [which_pg_config, "--bindir"],
           capture_output=True,
           text=True,
           check=True,
@@ -169,11 +183,23 @@ class JSModuleNode:
     self.dependencies = dependencies
     self.bytecode_hex: Optional[str] = None
 
+  @property
+  def name(self) -> str:
+    return self.module_name
+
+  @property
+  def source(self) -> str:
+    return self.source_code
+
+  @property
+  def requires(self) -> List[str]:
+    return self.dependencies
+
 
 def collect_js_module_graph(
     input_path: pathlib.Path,
-    pkg_name_override: Optional[str],
-    version_override: Optional[str],
+    pkg_name_override: Optional[str] = None,
+    version_override: Optional[str] = None,
 ) -> Tuple[str, str, str, List[JSModuleNode], Dict[str, Any]]:
   """Collects and topologically sorts all JS modules in a file or package directory."""
   pkg_meta: Dict[str, Any] = {}
@@ -254,12 +280,42 @@ def collect_js_module_graph(
         return f"{prefix}{rewritten}{quote}"
       else:
         clean_dep = spec
-        for pfx in ("pgtle:", "tle:"):
+        for pfx in ("plv8-pkg:", "plv8:", "pljs-pkg:", "pljs:", "pgtle:", "tle://", "tle:"):
           if clean_dep.startswith(pfx):
             clean_dep = clean_dep[len(pfx) :]
             break
+        clean_dep = clean_dep.lstrip("/")
         if clean_dep not in deps:
           deps.append(clean_dep)
+        # Also include the version-stripped module/package identifier in requires
+        # so engines that match requires entries without semver ranges (e.g. pljs)
+        # permit the resolved package version.
+        at_search = 1 if clean_dep.startswith("@") else 0
+        slash_pos = clean_dep.find("/", at_search)
+        if slash_pos != -1 and clean_dep.startswith("@"):
+          slash_pos = clean_dep.find("/", slash_pos + 1)
+        head = clean_dep if slash_pos == -1 else clean_dep[:slash_pos]
+        tail = "" if slash_pos == -1 else clean_dep[slash_pos + 1 :]
+        at_pos = head.find("@", at_search)
+        bare_dep = clean_dep
+        if at_pos != -1:
+          bare_pkg = head[:at_pos]
+          bare_dep = f"{bare_pkg}/{tail}" if tail else bare_pkg
+        elif tail and "@" in tail:
+          tail_at = tail.rfind("@")
+          if tail_at > 0:
+            bare_dep = f"{head}/{tail[:tail_at]}"
+        if bare_dep and bare_dep not in deps:
+          deps.append(bare_dep)
+        pkg_deps = (
+            pkg_meta.get("dependencies")
+            if isinstance(pkg_meta, dict) and isinstance(pkg_meta.get("dependencies"), dict)
+            else {}
+        )
+        if bare_dep in pkg_deps and pkg_deps[bare_dep]:
+          ver_spec = f"{bare_dep}@{pkg_deps[bare_dep]}"
+          if ver_spec not in deps:
+            deps.append(ver_spec)
         return full
 
     rewritten_source = IMPORT_SPEC_RE.sub(rewrite_spec, raw_source)
@@ -299,10 +355,12 @@ def compile_bytecode_via_psql(
   ext_name = engine
 
   for node in nodes:
+    pkg_part, _, sub_part = node.module_name.partition("/")
+    pkg_rel_path = sub_part if sub_part else "index.js"
     canonical_name = (
-        f"pgtle:{node.module_name}@{node.version}"
+        f"plv8:{pkg_part}@{node.version}/{pkg_rel_path}"
         if engine == "plv8"
-        else f"tle:{node.module_name}"
+        else f"pljs-pkg:{pkg_part}@{node.version}/{pkg_rel_path}"
     )
     src_lit = sql_dollar_quote(node.source_code, "bc_src")
     mod_lit = sql_literal(canonical_name)
@@ -604,6 +662,99 @@ def merge_wasm_manifest(
 # SQL Artifact Generators
 # ==============================================================================
 
+def _build_js_engine_catalog_sync_sql(
+    pkg_name: str,
+    version: str,
+    nodes: List[JSModuleNode],
+    ext_language: str,
+    pkg_meta: Dict[str, Any],
+    is_trusted: bool = True,
+) -> str:
+  """Builds a DO block that syncs a JS package into plv8/pljs catalogs (with self-contained fallback)."""
+  raw_deps = (
+      pkg_meta.get("dependencies", {})
+      if isinstance(pkg_meta, dict) and isinstance(pkg_meta.get("dependencies"), dict)
+      else {}
+  )
+  deps_json_lit = f"{sql_literal(json.dumps(raw_deps, sort_keys=True))}::jsonb"
+  pkg_lit = sql_literal(pkg_name)
+  ver_lit = sql_literal(version)
+  trusted_lit = "true" if is_trusted else "false"
+
+  lines: List[str] = [
+      "DO $tle_pkg_cat$",
+      "BEGIN",
+  ]
+  for eng in ("plv8", "pljs"):
+    if ext_language == eng:
+      if eng == "plv8":
+        bc_expr_from_m = (
+            "CASE WHEN m.bytecode IS NOT NULL AND pg_catalog.octet_length(m.bytecode) >= 8 "
+            "AND pg_catalog.substr(m.bytecode, 1, 8) = 'PLV8BC01'::bytea THEN m.bytecode ELSE NULL END"
+        )
+      else:
+        bc_expr_from_m = (
+            "CASE WHEN m.bytecode IS NOT NULL AND (pg_catalog.octet_length(m.bytecode) < 8 "
+            "OR pg_catalog.substr(m.bytecode, 1, 8) <> 'PLV8BC01'::bytea) THEN m.bytecode ELSE NULL END"
+        )
+    else:
+      bc_expr_from_m = "NULL::bytea"
+
+    lines.extend([
+        f"  IF pg_catalog.to_regclass('{eng}.packages') IS NOT NULL",
+        f"     AND pg_catalog.to_regclass('{eng}.modules') IS NOT NULL THEN",
+        f"    INSERT INTO {eng}.packages (name, version, entry_point, dependencies)",
+        f"    VALUES ({pkg_lit}, {ver_lit}, 'index.js', {deps_json_lit})",
+        "    ON CONFLICT (name, version) DO UPDATE",
+        "    SET entry_point = EXCLUDED.entry_point,",
+        "        dependencies = EXCLUDED.dependencies,",
+        "        updated_at = NOW();",
+    ])
+    for idx, node in enumerate(nodes, start=1):
+      rel_path = (
+          "index.js"
+          if node.module_name == pkg_name
+          else node.module_name[len(pkg_name) + 1 :]
+      )
+      mod_lit = sql_literal(node.module_name)
+      node_ver_lit = sql_literal(node.version)
+      src_fallback_dq = sql_dollar_quote(node.source_code, f"tle_cat_src_{idx}")
+      if node.bytecode_hex and ext_language == eng:
+        bc_col = f"COALESCE({bc_expr_from_m}, pg_catalog.decode('{node.bytecode_hex}', 'hex'))"
+      else:
+        bc_col = bc_expr_from_m
+      if node.dependencies:
+        dep_items = ", ".join(sql_literal(d) for d in node.dependencies)
+        deps_fallback = f"ARRAY[{dep_items}]::text[]"
+      else:
+        deps_fallback = "NULL::text[]"
+
+      rel_paths = [rel_path]
+      if rel_path != "index.js" and not rel_path.endswith((".js", ".mjs", ".cjs")):
+        rel_paths.append(f"{rel_path}.js")
+
+      for rp in rel_paths:
+        rel_lit = sql_literal(rp)
+        lines.extend([
+            f"    INSERT INTO {eng}.modules (path, package_name, package_version, source, bytecode, requires, is_trusted)",
+            f"    SELECT {rel_lit}, {pkg_lit}, COALESCE(m.version, {node_ver_lit}), COALESCE(m.source_code, {src_fallback_dq}), {bc_col}, COALESCE(m.dependencies, {deps_fallback}), COALESCE(m.is_trusted, {trusted_lit})",
+            "    FROM (SELECT 1) AS _tle_one",
+            f"    LEFT JOIN pgtle.modules m ON m.module_name = {mod_lit} AND m.version = {node_ver_lit}",
+            "    ON CONFLICT (package_name, package_version, path) WHERE package_name IS NOT NULL DO UPDATE",
+            "    SET source = EXCLUDED.source,",
+            "        bytecode = EXCLUDED.bytecode,",
+            "        requires = EXCLUDED.requires,",
+            "        is_trusted = EXCLUDED.is_trusted,",
+            "        updated_at = NOW();",
+        ])
+    lines.append("  END IF;")
+  lines.extend([
+      "END;",
+      "$tle_pkg_cat$;",
+  ])
+  return "\n".join(lines)
+
+
 def generate_js_bundle_sql(
     pkg_name: str,
     version: str,
@@ -626,6 +777,14 @@ def generate_js_bundle_sql(
       "-- =============================================================================",
       "",
       "CREATE EXTENSION IF NOT EXISTS pg_tle;",
+      "DO $tle_engine_init$",
+      "BEGIN",
+      f"  IF pg_catalog.to_regclass('{ext_language}.packages') IS NULL",
+      f"     AND EXISTS (SELECT 1 FROM pg_catalog.pg_available_extensions WHERE name = {sql_literal(ext_language)}) THEN",
+      f"    CREATE EXTENSION IF NOT EXISTS {ext_language};",
+      "  END IF;",
+      "END;",
+      "$tle_engine_init$;",
       "",
       "BEGIN;",
       "",
@@ -643,13 +802,18 @@ def generate_js_bundle_sql(
 
   for idx, node in enumerate(nodes, start=1):
     src_dq = sql_dollar_quote(node.source_code, f"tle_mod_{idx}")
+    pkg_rel_path = (
+        "index.js"
+        if node.module_name == pkg_name
+        else node.module_name[len(pkg_name) + 1 :]
+    )
     if node.bytecode_hex:
       bc_expr = f"decode('{node.bytecode_hex}', 'hex')"
     elif compile_bytecode:
       rname = (
-          f"pgtle:{node.module_name}@{node.version}"
+          f"plv8:{pkg_name}@{node.version}/{pkg_rel_path}"
           if ext_language == "plv8"
-          else f"tle:{node.module_name}"
+          else f"pljs-pkg:{pkg_name}@{node.version}/{pkg_rel_path}"
       )
       bc_expr = f"pg_temp._tle_pack_compile_bc({src_dq}, {sql_literal(rname)})"
     else:
@@ -677,14 +841,47 @@ def generate_js_bundle_sql(
     )
     out.append("")
 
+  catalog_sync_sql = _build_js_engine_catalog_sync_sql(
+      pkg_name=pkg_name,
+      version=version,
+      nodes=nodes,
+      ext_language=ext_language,
+      pkg_meta=pkg_meta,
+      is_trusted=is_trusted,
+  )
+  out.append(catalog_sync_sql)
+  out.append("")
+
   # Optional: also register a pg_tle extension that exposes SQL wrapper functions
   # declared in package.json -> "pgtle": {"functions": [...]}
   pgtle_cfg = pkg_meta.get("pgtle", {}) if isinstance(pkg_meta, dict) else {}
   exported_sql_funcs = pgtle_cfg.get("functions", [])
+  entry_node = next((n for n in nodes if n.module_name == pkg_name), nodes[-1] if nodes else None)
+  entry_is_cjs = False
+  if entry_node is not None:
+    if entry_node.file_path.suffix == ".cjs":
+      entry_is_cjs = True
+    elif entry_node.file_path.suffix != ".mjs":
+      stripped_src = IMPORT_SPEC_RE.sub(
+          lambda m: "" if (m.group("comment") or m.group("string")) else m.group(0),
+          entry_node.source_code,
+      )
+      if not re.search(r"\bexport\b", stripped_src) and re.search(
+          r"\b(?:module\.exports|exports|require\s*\()\b", stripped_src
+      ):
+        entry_is_cjs = True
   if as_extension or create_extension or exported_sql_funcs:
-    ext_stmts: List[str] = []
+    ext_stmts: List[str] = [catalog_sync_sql]
     for fn_spec in exported_sql_funcs:
       sql_fn_name = fn_spec.get("name") or fn_spec.get("sql_name")
+      fn_schema = fn_spec.get("schema")
+      if fn_schema:
+        qual_fn_name = f'"{fn_schema}"."{sql_fn_name}"'
+      elif "." in str(sql_fn_name):
+        s_part, f_part = str(sql_fn_name).split(".", 1)
+        qual_fn_name = f'"{s_part.strip(chr(34))}"."{f_part.strip(chr(34))}"'
+      else:
+        qual_fn_name = f'"{sql_fn_name}"'
       js_export = fn_spec.get("export") or fn_spec.get("js_export") or sql_fn_name
       ret_type = fn_spec.get("returns", "text")
       volatility = fn_spec.get("volatility", "IMMUTABLE")
@@ -710,11 +907,20 @@ def generate_js_bundle_sql(
           call_args.append(arg_name)
       named_sig = ", ".join(named_args)
       js_call_args = ", ".join(call_args)
+      if js_export == "default":
+        import_stmt = f"import __tle_default_fn from 'tle:{pkg_name}@{version}';"
+        call_stmt = f"return __tle_default_fn({js_call_args});"
+      elif entry_is_cjs:
+        import_stmt = f"import __tle_cjs_mod from 'tle:{pkg_name}@{version}';"
+        call_stmt = f"return __tle_cjs_mod.{js_export}({js_call_args});"
+      else:
+        import_stmt = f"import {{ {js_export} }} from 'tle:{pkg_name}@{version}';"
+        call_stmt = f"return {js_export}({js_call_args});"
       ext_stmts.append(
-          f'CREATE OR REPLACE FUNCTION "{sql_fn_name}"({named_sig})\n'
+          f"CREATE OR REPLACE FUNCTION {qual_fn_name}({named_sig})\n"
           f'RETURNS {ret_type} LANGUAGE "{lang}" {volatility}{strict_kw}\n'
-          f"AS $fn$import {{ {js_export} }} from 'tle:{pkg_name}@{version}';\n"
-          f"return {js_export}({js_call_args});$fn$;"
+          f"AS $fn${import_stmt}\n"
+          f"{call_stmt}$fn$;"
       )
     ext_sql_body = "\n\n".join(ext_stmts) if ext_stmts else "-- Module-only TLE package"
     ext_dq = sql_dollar_quote(ext_sql_body, "tle_ext_sql")
@@ -852,6 +1058,36 @@ return {{
 # CLI Entrypoint
 # ==============================================================================
 
+def _infer_js_engine(
+    explicit_engine: Optional[str],
+    pkg_meta: Dict[str, Any],
+) -> str:
+  if explicit_engine in ("plv8", "pljs"):
+    return explicit_engine
+  pgtle_cfg = pkg_meta.get("pgtle", {}) if isinstance(pkg_meta, dict) else {}
+  if not isinstance(pgtle_cfg, dict):
+    return "plv8"
+  cfg_lang = pgtle_cfg.get("language") or pgtle_cfg.get("engine")
+  if cfg_lang in ("plv8", "pljs"):
+    return str(cfg_lang)
+  req_list = pgtle_cfg.get("requires")
+  if isinstance(req_list, list):
+    if "pljs" in req_list and "plv8" not in req_list:
+      return "pljs"
+    if "plv8" in req_list and "pljs" not in req_list:
+      return "plv8"
+  fn_specs = pgtle_cfg.get("functions")
+  if isinstance(fn_specs, list) and fn_specs:
+    fn_langs = {
+        str(fn.get("language"))
+        for fn in fn_specs
+        if isinstance(fn, dict) and fn.get("language")
+    }
+    if fn_langs == {"pljs"}:
+      return "pljs"
+  return "plv8"
+
+
 def pack_js_target(args: argparse.Namespace) -> str:
   input_path = pathlib.Path(args.input)
   pkg_name, version, description, nodes, pkg_meta = collect_js_module_graph(
@@ -862,10 +1098,12 @@ def pack_js_target(args: argparse.Namespace) -> str:
   if args.description:
     description = args.description
 
+  engine = _infer_js_engine(getattr(args, "engine", None), pkg_meta)
+
   if args.compile_bytecode and args.dsn:
     compile_bytecode_via_psql(
         nodes=nodes,
-        engine=args.engine,
+        engine=engine,
         dsn=args.dsn,
         psql_bin=args.psql_bin,
     )
@@ -879,7 +1117,7 @@ def pack_js_target(args: argparse.Namespace) -> str:
       as_extension=args.as_extension,
       create_extension=args.create_extension,
       compile_bytecode=args.compile_bytecode,
-      ext_language=args.engine,
+      ext_language=engine,
       pkg_meta=pkg_meta,
   )
 
@@ -1013,9 +1251,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument(
       "--engine",
+      "--language",
+      dest="engine",
       choices=["plv8", "pljs"],
-      default="plv8",
-      help="Target JS engine for bytecode compilation or wrapper functions (default: plv8).",
+      default=None,
+      help=(
+          "Target JS engine for bytecode compilation or wrapper functions "
+          "(default: inferred from package.json pgtle config or plv8)."
+      ),
   )
   parser.add_argument(
       "--dsn",

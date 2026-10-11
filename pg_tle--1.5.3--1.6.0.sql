@@ -460,7 +460,9 @@ BEGIN
 
     globalThis.__plv8_wasm_resolve_module = function(modName, modVersion) {
       let cleanName = String(modName || '');
-      if (cleanName.startsWith('pgtle:')) cleanName = cleanName.slice(6);
+      if (cleanName.startsWith('plv8:')) cleanName = cleanName.slice(5);
+      else if (cleanName.startsWith('pgtle:')) cleanName = cleanName.slice(6);
+      else if (cleanName.startsWith('tle://')) cleanName = cleanName.slice(6);
       else if (cleanName.startsWith('tle:')) cleanName = cleanName.slice(4);
       let cleanVer = modVersion ? String(modVersion) : null;
       const atIdx = cleanName.indexOf('@', cleanName.startsWith('@') ? 1 : 0);
@@ -473,11 +475,13 @@ BEGIN
       try {
         const plv8Rows = cleanVer
           ? plv8.execute(
-              `SELECT COALESCE(package_name, path) AS module_name, COALESCE(package_version, 'standalone') AS version, source AS source_code, bytecode, is_trusted
-               FROM plv8.modules
-               WHERE (package_name = $1 AND package_version = $2)
-                  OR (package_name IS NULL AND path = $1)
-               ORDER BY package_name NULLS LAST LIMIT 1`,
+              `SELECT COALESCE(m.package_name, m.path) AS module_name, COALESCE(m.package_version, 'standalone') AS version, m.source AS source_code, m.bytecode, m.is_trusted
+               FROM plv8.modules m
+               LEFT JOIN plv8.packages p ON p.name = m.package_name AND p.version = m.package_version
+               WHERE (m.package_name = $1 AND m.package_version = $2 AND (p.entry_point IS NULL OR m.path = p.entry_point))
+                  OR (m.package_name IS NULL AND m.path = $1)
+               ORDER BY (pg_catalog.octet_length(m.bytecode) >= 4 AND pg_catalog.substr(m.bytecode, 1, 4) = '\\x0061736d'::bytea) DESC,
+                        m.package_name NULLS LAST LIMIT 1`,
               [cleanName, cleanVer]
             )
           : plv8.execute(
@@ -486,7 +490,8 @@ BEGIN
                LEFT JOIN plv8.packages p ON p.name = m.package_name AND p.version = m.package_version
                WHERE (m.package_name = $1 AND (p.entry_point IS NULL OR m.path = p.entry_point))
                   OR (m.package_name IS NULL AND m.path = $1)
-               ORDER BY m.package_version DESC NULLS LAST LIMIT 1`,
+               ORDER BY (pg_catalog.octet_length(m.bytecode) >= 4 AND pg_catalog.substr(m.bytecode, 1, 4) = '\\x0061736d'::bytea) DESC,
+                        m.package_version DESC NULLS LAST LIMIT 1`,
               [cleanName]
             );
         if (plv8Rows && plv8Rows.length > 0 && plv8Rows[0].bytecode && plv8Rows[0].bytecode.length >= 8) {
@@ -554,7 +559,7 @@ BEGIN
         [cleanName]
       );
       if (!rows || rows.length === 0 || !rows[0].wasm_bytecode) {
-        throw new Error('pl/v8-wasm: module "' + modName + '" not found in pgtle.modules or public.plv8_wasm_modules');
+        throw new Error('pl/v8-wasm: module "' + modName + '" not found in plv8.modules, pgtle.modules, or public.plv8_wasm_modules');
       }
       return {
         cacheKey: 'catalog:' + cleanName + ':' + rows[0].xmin + ':' + rows[0].ctid,
@@ -970,7 +975,7 @@ BEGIN
           plv8.compile_wasm_cached(resolved.cacheKey, resolved.wasmBytes);
         }
       } catch (e) {
-        if (e && String(e.message || e).indexOf('permission denied for untrusted module') !== -1) {
+        if (e && String(e.message || e).indexOf('permission denied for untrusted') !== -1) {
           throw e;
         }
       }

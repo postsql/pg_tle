@@ -595,6 +595,12 @@ JOIN rust_vecs v2 ON v1.id = 1 AND v2.id = 2;
 
 -- 4. Execute SQL inside Rust WASM via postgres.spi_exec (including recursive WASM calls)
 SELECT rust_spi_query('SELECT id, v::text AS vec, rust_reverse_upper(''nested'') AS nested FROM rust_vecs ORDER BY id');
+
+-- 5. Verify the registered WASM package in plv8.packages, plv8.modules, and pgtle.modules
+SELECT p.name, p.version, p.entry_point, m.path, octet_length(m.bytecode) AS wasm_bytes, m.is_trusted
+FROM plv8.packages p
+JOIN plv8.modules m ON m.package_name = p.name AND m.package_version = p.version
+WHERE p.name = 'rust_wasm_ext';
 ```
 
 ---
@@ -772,9 +778,9 @@ SELECT spi_sum_series(100);
 
 ---
 
-## 5. Standalone `"pl/v8-wasm"` Usage (Inline Base64 & Catalog Table)
+## 5. Standalone `"pl/v8-wasm"` Usage & Direct `LANGUAGE plv8` Imports
 
-In addition to packaging full `pg_tle` extensions with `tle-pack wasm`, you can create standalone `"pl/v8-wasm"` functions directly in SQL:
+In addition to packaging full `pg_tle` extensions with `tle-pack wasm`, you can create standalone `"pl/v8-wasm"` functions directly in SQL or import registered WASM modules inside `LANGUAGE plv8`:
 
 ### 5.1 Inline Base64 Micro-Functions (`"wasm"`)
 
@@ -810,4 +816,19 @@ SELECT pgtle.install_wasm_extension(
 
 CREATE EXTENSION my_rust_ext;
 SELECT my_rust_add(10, 32);
+```
+
+### 5.3 Importing Rust WASM Modules Directly in `LANGUAGE plv8`
+
+When `pgtle.install_wasm_extension()` (or `pgwasm-pack`) registers your `.wasm` binary, it populates `plv8.packages` and `plv8.modules` (`entry_point = 'index.wasm'`, `path = 'index.wasm'`) in addition to `pgtle.modules` and `public.plv8_wasm_modules`. You can import any registered Rust `.wasm` module directly inside a `LANGUAGE plv8` function via `tle:<name>` (or `plv8:<name>`):
+
+```sql
+CREATE OR REPLACE FUNCTION plv8_call_rust_wasm(a int, b int)
+RETURNS int LANGUAGE plv8 AS $$
+  import wasm, { memory } from 'tle:rust_wasm_ext';
+  return wasm.add_i32(a, b);
+$$;
+
+SELECT plv8_call_rust_wasm(19, 23);
+-- Returns: 42
 ```

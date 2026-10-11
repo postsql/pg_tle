@@ -617,13 +617,19 @@ JOIN go_vecs v2 ON v1.id = 1 AND v2.id = 2;
 
 -- 4. Execute SQL inside Go WASM via postgres.spi_exec (including nested WASM calls)
 SELECT go_spi_query('SELECT id, v::text AS vec, go_reverse_upper(''nested'') AS nested FROM go_vecs ORDER BY id');
+
+-- 5. Verify the registered WASM package in plv8.packages, plv8.modules, and pgtle.modules
+SELECT p.name, p.version, p.entry_point, m.path, octet_length(m.bytecode) AS wasm_bytes, m.is_trusted
+FROM plv8.packages p
+JOIN plv8.modules m ON m.package_name = p.name AND m.package_version = p.version
+WHERE p.name = 'go_wasm_ext';
 ```
 
 ---
 
 ## 4. Importing Go/TinyGo WASM Modules Directly in `LANGUAGE plv8`
 
-When `pgtle.install_wasm_extension()` registers your `.wasm` binary, it also stores the bytecode in `pgtle.modules` under the `tle:<extension_name>` specifier. You can import any Go, TinyGo, or Rust WebAssembly module directly inside a JavaScript `LANGUAGE plv8` stored procedure using ES module `import` or CommonJS `require()`:
+When `pgtle.install_wasm_extension()` (or `pgwasm-pack`) registers your `.wasm` binary, it stores the module in `plv8.packages` / `plv8.modules` (`entry_point = 'index.wasm'`, `path = 'index.wasm'`), `pgtle.modules`, and `public.plv8_wasm_modules` under the `tle:<extension_name>` (or `plv8:<extension_name>`) specifier. You can import any Go, TinyGo, or Rust WebAssembly module directly inside a JavaScript `LANGUAGE plv8` stored procedure using ES module `import` or CommonJS `plv8.require()`:
 
 ```sql
 CREATE OR REPLACE FUNCTION plv8_call_go_wasm(a int, b int)
