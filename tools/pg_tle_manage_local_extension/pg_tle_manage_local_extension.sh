@@ -19,7 +19,17 @@ DEBUG=0
 PROGRAM_NAME=$(basename $0)
 PROGRAM_VERSION="1.1"
 
-PGCLI=$(which psql)
+if [ -n "${TLE_PACK_PSQL:-}" ]; then
+  PGCLI="${TLE_PACK_PSQL}"
+elif command -v psql >/dev/null 2>&1; then
+  PGCLI="$(command -v psql)"
+elif [ -n "${PG_CONFIG:-}" ] && [ -x "$(${PG_CONFIG} --bindir 2>/dev/null)/psql" ]; then
+  PGCLI="$(${PG_CONFIG} --bindir)/psql"
+elif command -v pg_config >/dev/null 2>&1 && [ -x "$(pg_config --bindir 2>/dev/null)/psql" ]; then
+  PGCLI="$(pg_config --bindir)/psql"
+else
+  PGCLI=""
+fi
 PGFLAGS_DML="--quiet --no-align --tuples-only"
 PGFLAGS_QRY="--quiet"
 
@@ -109,19 +119,27 @@ USAGE_EOF
 }
 
 RUN_PGSQL(){
-  if [[ "$1" = "" ]]; then
-    PG_OUTPUT=$(psql ${pgConn} ${PGFLAGS} --command="${SQL_QUERY}" 2>&1)
+  if [[ "${pgConn}" == -* ]]; then
+    if [[ "$1" = "" ]]; then
+      PG_OUTPUT=$("${PGCLI}" ${pgConn} ${PGFLAGS} --command="${SQL_QUERY}" 2>&1)
+    else
+      PG_OUTPUT=$("${PGCLI}" ${pgConn} ${PGFLAGS} -f "${1}" 2>&1)
+    fi
   else
-    PG_OUTPUT=$(psql ${pgConn} ${PGFLAGS} -f "${1}" 2>&1)
+    if [[ "$1" = "" ]]; then
+      PG_OUTPUT=$("${PGCLI}" "${pgConn}" ${PGFLAGS} --command="${SQL_QUERY}" 2>&1)
+    else
+      PG_OUTPUT=$("${PGCLI}" "${pgConn}" ${PGFLAGS} -f "${1}" 2>&1)
+    fi
   fi
   PG_EXIT=$?
 }
 OS_TYPE=$(uname)
 if [ "${OS_TYPE}" = "Linux" ]; then
-  SUPPORTED_ARGS=$(getopt -o c:a:p:n:s:mhvd --long connection:,action:,extpath:,name:,sqldir:,runmake,help,version,debug -- "$@")
+  SUPPORTED_ARGS=$(getopt -o c:a:p:n:s:mhvVd --long connection:,action:,extpath:,name:,sqldir:,runmake,help,version,debug -- "$@")
   EX=$?
 elif [ "${OS_TYPE}" = "Darwin" ]; then
-  SUPPORTED_ARGS=$(getopt c:a:p:n:s:mhvd $*)
+  SUPPORTED_ARGS=$(getopt c:a:p:n:s:mhvVd $*)
   EX=$?
 else
   echo "Unsupport OS"
@@ -180,7 +198,7 @@ while true; do
         usage
         exit 0
         ;;
-    -v | --version)
+    -v | -V | --version)
         version
         exit 0
         ;;

@@ -155,10 +155,13 @@ BEGIN
     GRANT ALL ON TABLE public.plv8_wasm_modules TO pgtle_admin;
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'pl/v8-wasm') THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'pl/v8-wasm')
+     OR COALESCE(pg_catalog.strpos(pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure('public.plv8_wasm_handler()')), 'config.return_mode === ''fixed'''), 0) = 0
+  THEN
     CREATE OR REPLACE FUNCTION public.plv8_wasm_bootstrap_polyfills()
   RETURNS void AS $wasm_poly$
-    if (typeof globalThis.__plv8_wasm_polyfills_loaded !== 'undefined') {
+    if (typeof globalThis.__plv8_wasm_polyfills_loaded !== 'undefined' &&
+        typeof globalThis.__plv8_wasm_create_postgres === 'function') {
       return;
     }
 
@@ -283,8 +286,177 @@ BEGIN
           }
           return new Uint8Array(buf);
         }
+        encodeInto(str, dest) {
+          str = String(str);
+          let read = 0;
+          let written = 0;
+          const max = dest.length;
+          while (read < str.length) {
+            const c = str.charCodeAt(read);
+            if (c < 0x80) {
+              if (written + 1 > max) break;
+              dest[written++] = c;
+              read++;
+            } else if (c < 0x800) {
+              if (written + 2 > max) break;
+              dest[written++] = 0xc0 | (c >> 6);
+              dest[written++] = 0x80 | (c & 0x3f);
+              read++;
+            } else if (c >= 0xd800 && c <= 0xdbff && read + 1 < str.length) {
+              const c2 = str.charCodeAt(read + 1);
+              if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+                if (written + 4 > max) break;
+                const cp = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+                dest[written++] = 0xf0 | (cp >> 18);
+                dest[written++] = 0x80 | ((cp >> 12) & 0x3f);
+                dest[written++] = 0x80 | ((cp >> 6) & 0x3f);
+                dest[written++] = 0x80 | (cp & 0x3f);
+                read += 2;
+              } else {
+                if (written + 3 > max) break;
+                dest[written++] = 0xe0 | (c >> 12);
+                dest[written++] = 0x80 | ((c >> 6) & 0x3f);
+                dest[written++] = 0x80 | (c & 0x3f);
+                read++;
+              }
+            } else {
+              if (written + 3 > max) break;
+              dest[written++] = 0xe0 | (c >> 12);
+              dest[written++] = 0x80 | ((c >> 6) & 0x3f);
+              dest[written++] = 0x80 | (c & 0x3f);
+              read++;
+            }
+          }
+          return { read: read, written: written };
+        }
       };
     }
+
+    globalThis.__plv8_wasm_create_wasi = function(getInstance) {
+      if (typeof globalThis.__plv8_wasm_create_postgres === 'function') {
+        globalThis.postgres = globalThis.__plv8_wasm_create_postgres(getInstance);
+      }
+      let stderrBuf = '';
+      return {
+        args_sizes_get: function(argcPtr, argvBufSizePtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          dv.setUint32(argcPtr >>> 0, 0, true);
+          dv.setUint32(argvBufSizePtr >>> 0, 0, true);
+          return 0;
+        },
+        args_get: function(_argvPtr, _argvBufPtr) {
+          return 0;
+        },
+        environ_sizes_get: function(environCountPtr, environBufSizePtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          dv.setUint32(environCountPtr >>> 0, 0, true);
+          dv.setUint32(environBufSizePtr >>> 0, 0, true);
+          return 0;
+        },
+        environ_get: function(_environPtr, _environBufPtr) {
+          return 0;
+        },
+        clock_res_get: function(_clockId, resPtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          dv.setBigUint64(resPtr >>> 0, 1000n, true);
+          return 0;
+        },
+        clock_time_get: function(_clockId, _precision, timePtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          const ns = BigInt(Math.floor(Date.now() * 1000000));
+          dv.setBigUint64(timePtr >>> 0, ns, true);
+          return 0;
+        },
+        fd_write: function(fd, iovsPtr, iovsLen, nwrittenPtr) {
+          const inst = getInstance();
+          const memBuf = inst.exports.memory.buffer;
+          const dv = new DataView(memBuf);
+          let total = 0;
+          let text = '';
+          const dec = new globalThis.TextDecoder('utf-8');
+          for (let i = 0; i < (iovsLen >>> 0); i++) {
+            const base = (iovsPtr >>> 0) + i * 8;
+            const ptr = dv.getUint32(base, true);
+            const len = dv.getUint32(base + 4, true);
+            if (len > 0 && ptr + len <= memBuf.byteLength) {
+              const chunk = new Uint8Array(memBuf, ptr, len);
+              total += len;
+              if (fd === 1 || fd === 2) {
+                text += dec.decode(chunk);
+              }
+            }
+          }
+          dv.setUint32(nwrittenPtr >>> 0, total, true);
+          if (fd === 2 && text.length > 0) {
+            stderrBuf += text;
+          }
+          return 0;
+        },
+        fd_read: function(_fd, _iovsPtr, _iovsLen, nreadPtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          dv.setUint32(nreadPtr >>> 0, 0, true);
+          return 0;
+        },
+        fd_close: function(_fd) {
+          return 0;
+        },
+        fd_fdstat_get: function(fd, statPtr) {
+          const inst = getInstance();
+          const memBuf = inst.exports.memory.buffer;
+          if ((statPtr >>> 0) + 24 <= memBuf.byteLength) {
+            const u8 = new Uint8Array(memBuf, statPtr >>> 0, 24);
+            u8.fill(0);
+            if (fd <= 2) {
+              u8[0] = 2; // CHARACTER_DEVICE
+              return 0;
+            }
+          }
+          return 8; // EBADF
+        },
+        fd_fdstat_set_flags: function(_fd, _flags) {
+          return 0;
+        },
+        fd_prestat_get: function(_fd, _bufPtr) {
+          return 8; // EBADF (terminates Go syscall/fs_wasip1 preopen scan loop)
+        },
+        fd_prestat_dir_name: function(_fd, _pathPtr, _pathLen) {
+          return 8; // EBADF
+        },
+        fd_seek: function(_fd, _offset, _whence, _newoffsetPtr) {
+          return 29; // ESPIPE
+        },
+        path_open: function() {
+          return 44; // ENOENT
+        },
+        random_get: function(bufPtr, bufLen) {
+          const inst = getInstance();
+          const u8 = new Uint8Array(inst.exports.memory.buffer, bufPtr >>> 0, bufLen >>> 0);
+          for (let i = 0; i < u8.length; i++) {
+            u8[i] = (Math.random() * 256) | 0;
+          }
+          return 0;
+        },
+        poll_oneoff: function(_inPtr, _outPtr, _nsubscriptions, neventsPtr) {
+          const inst = getInstance();
+          const dv = new DataView(inst.exports.memory.buffer);
+          dv.setUint32(neventsPtr >>> 0, 0, true);
+          return 0;
+        },
+        sched_yield: function() {
+          return 0;
+        },
+        proc_exit: function(code) {
+          const msg = stderrBuf ? (': ' + stderrBuf.trim()) : '';
+          stderrBuf = '';
+          throw new Error('WASM proc_exit(' + code + ')' + msg);
+        }
+      };
+    };
 
     globalThis.__plv8_wasm_resolve_module = function(modName, modVersion) {
       let cleanName = String(modName || '');
@@ -298,6 +470,53 @@ BEGIN
       }
 
       let untrustedErr = null;
+      try {
+        const plv8Rows = cleanVer
+          ? plv8.execute(
+              `SELECT COALESCE(package_name, path) AS module_name, COALESCE(package_version, 'standalone') AS version, source AS source_code, bytecode, is_trusted
+               FROM plv8.modules
+               WHERE (package_name = $1 AND package_version = $2)
+                  OR (package_name IS NULL AND path = $1)
+               ORDER BY package_name NULLS LAST LIMIT 1`,
+              [cleanName, cleanVer]
+            )
+          : plv8.execute(
+              `SELECT COALESCE(m.package_name, m.path) AS module_name, COALESCE(m.package_version, 'standalone') AS version, m.source AS source_code, m.bytecode, m.is_trusted
+               FROM plv8.modules m
+               LEFT JOIN plv8.packages p ON p.name = m.package_name AND p.version = m.package_version
+               WHERE (m.package_name = $1 AND (p.entry_point IS NULL OR m.path = p.entry_point))
+                  OR (m.package_name IS NULL AND m.path = $1)
+               ORDER BY m.package_version DESC NULLS LAST LIMIT 1`,
+              [cleanName]
+            );
+        if (plv8Rows && plv8Rows.length > 0 && plv8Rows[0].bytecode && plv8Rows[0].bytecode.length >= 8) {
+          if (plv8Rows[0].is_trusted === false) {
+            const supRows = plv8.execute("SELECT pg_catalog.current_setting('is_superuser') AS is_sup");
+            if (!supRows || supRows.length === 0 || supRows[0].is_sup !== 'on') {
+              untrustedErr = new Error('pl/v8-wasm: permission denied for untrusted WASM module "' + cleanName + '"');
+              throw untrustedErr;
+            }
+          }
+          const bc = plv8Rows[0].bytecode;
+          if (bc[0] === 0x00 && bc[1] === 0x61 && bc[2] === 0x73 && bc[3] === 0x6d) {
+            const ver = plv8Rows[0].version || 'latest';
+            const hash = globalThis.__plv8_wasm_hash_bytes(bc);
+            const src = (plv8Rows[0].source_code && plv8Rows[0].source_code.trim().length > 0 && !plv8Rows[0].source_code.trim().startsWith('{'))
+              ? plv8Rows[0].source_code
+              : null;
+            return {
+              cacheKey: 'plv8:' + cleanName + ':' + ver + ':' + hash,
+              wasmBytes: bc,
+              glueSource: src
+            };
+          }
+        }
+      } catch (_err) {
+        if (untrustedErr) {
+          throw untrustedErr;
+        }
+      }
+
       try {
         const tleRows = cleanVer
           ? plv8.execute('SELECT module_name, version, source_code, bytecode, is_trusted FROM pgtle.get_module($1, $2)', [cleanName, cleanVer])
@@ -389,12 +608,33 @@ BEGIN
             : 32768);
       scratchOffset = (scratchOffset + 7) & ~7;
 
-      const allocFn = allocExport
-        ? instance.exports[allocExport]
-        : (instance.exports.alloc || instance.exports.malloc || null);
-      const freeFn = freeExport
-        ? instance.exports[freeExport]
-        : (instance.exports.free || null);
+      let allocFn = null;
+      let freeFn = null;
+      if (allocExport) {
+        allocFn = instance.exports[allocExport] || null;
+        if (freeExport) {
+          freeFn = instance.exports[freeExport] || null;
+        } else if (allocExport === 'alloc' && typeof instance.exports.dealloc === 'function') {
+          freeFn = instance.exports.dealloc;
+        } else if (allocExport === 'malloc' && typeof instance.exports.free === 'function') {
+          freeFn = instance.exports.free;
+        }
+      } else if (typeof instance.exports.alloc === 'function') {
+        allocFn = instance.exports.alloc;
+        freeFn = freeExport
+          ? (instance.exports[freeExport] || null)
+          : (typeof instance.exports.dealloc === 'function' ? instance.exports.dealloc : null);
+      } else if (typeof instance.exports.malloc === 'function') {
+        allocFn = instance.exports.malloc;
+        freeFn = freeExport
+          ? (instance.exports[freeExport] || null)
+          : (typeof instance.exports.free === 'function' ? instance.exports.free : null);
+      } else if (typeof instance.exports.__wbindgen_malloc === 'function') {
+        allocFn = instance.exports.__wbindgen_malloc;
+        freeFn = freeExport
+          ? (instance.exports[freeExport] || null)
+          : (typeof instance.exports.__wbindgen_free === 'function' ? instance.exports.__wbindgen_free : null);
+      }
 
       try {
         for (let i = 0; i < rawArgs.length; i++) {
@@ -422,7 +662,7 @@ BEGIN
             const len = bytes.length;
             let ptr = 0;
             if (typeof allocFn === 'function') {
-              ptr = allocFn(len + 1) >>> 0;
+              ptr = allocFn(len + 1, 1) >>> 0;
               allocatedPtrs.push({ ptr: ptr, len: len + 1 });
             } else {
               const needed = scratchOffset + len + 16;
@@ -477,10 +717,21 @@ BEGIN
             outPtr = rawRes[0] >>> 0;
             outLen = rawRes[1] >>> 0;
           } else if (typeof rawRes === 'bigint') {
-            outPtr = Number(rawRes & 0xffffffffn) >>> 0;
-            outLen = Number((rawRes >> 32n) & 0xffffffffn) >>> 0;
+            if (rawRes === 0n) {
+              return null;
+            }
+            if (retMode === 'ptr_len' || retMode === 'ptr_high') {
+              outPtr = Number((rawRes >> 32n) & 0xffffffffn) >>> 0;
+              outLen = Number(rawRes & 0xffffffffn) >>> 0;
+            } else {
+              outPtr = Number(rawRes & 0xffffffffn) >>> 0;
+              outLen = Number((rawRes >> 32n) & 0xffffffffn) >>> 0;
+            }
           } else if (typeof rawRes === 'number') {
             const ptr = rawRes >>> 0;
+            if (ptr === 0) {
+              return null;
+            }
             if (callSpec.returnLength > 0) {
               outPtr = ptr;
               outLen = callSpec.returnLength >>> 0;
@@ -523,11 +774,81 @@ BEGIN
         if (typeof freeFn === 'function' && allocatedPtrs.length > 0) {
           for (let i = 0; i < allocatedPtrs.length; i++) {
             try {
-              freeFn(allocatedPtrs[i].ptr, allocatedPtrs[i].len);
+              freeFn(allocatedPtrs[i].ptr, allocatedPtrs[i].len, 1);
             } catch (_ignoreFreeErr) {}
           }
         }
       }
+    };
+
+    globalThis.__plv8_wasm_create_postgres = function(getInstance) {
+      const spiExecImpl = function(sql) {
+        const replacer = function(_k, v) {
+          return typeof v === 'bigint' ? Number(v) : v;
+        };
+        if (typeof sql === 'string') {
+          return JSON.stringify(plv8.execute(sql), replacer);
+        }
+        const inst = getInstance();
+        const query = new globalThis.TextDecoder('utf-8').decode(
+          new Uint8Array(inst.exports.memory.buffer, sql >>> 0, arguments[1] >>> 0)
+        );
+        const jsonStr = JSON.stringify(plv8.execute(query), replacer);
+        const jsonBytes = new globalThis.TextEncoder().encode(jsonStr);
+        if (arguments.length >= 4) {
+          const outPtr = arguments[2] >>> 0;
+          const outCap = arguments[3] >>> 0;
+          if (outCap > 0 && outPtr > 0) {
+            const copyLen = Math.min(jsonBytes.length, outCap);
+            new Uint8Array(inst.exports.memory.buffer, outPtr, copyLen).set(
+              jsonBytes.subarray(0, copyLen)
+            );
+          }
+          return jsonBytes.length | 0;
+        }
+        if (jsonBytes.length === 0) {
+          return 0n;
+        }
+        const alloc = inst.exports.alloc || inst.exports.malloc || null;
+        let ptr = 0;
+        if (typeof alloc === 'function') {
+          ptr = alloc(jsonBytes.length, 1) >>> 0;
+        } else {
+          const base = (inst.exports.__heap_base && typeof inst.exports.__heap_base.value === 'number')
+            ? (inst.exports.__heap_base.value >>> 0)
+            : 49152;
+          const needed = base + jsonBytes.length + 16;
+          const cur = inst.exports.memory.buffer.byteLength;
+          if (needed > cur) {
+            inst.exports.memory.grow(Math.ceil((needed - cur) / 65536));
+          }
+          ptr = base;
+        }
+        const memView = new Uint8Array(inst.exports.memory.buffer);
+        memView.set(jsonBytes, ptr);
+        return (BigInt(jsonBytes.length) << 32n) | BigInt(ptr >>> 0);
+      };
+      return {
+        spi_exec: spiExecImpl,
+        spi_exec_buf: spiExecImpl,
+        elog_notice: function(msg) {
+          if (arguments.length >= 2 && typeof msg === 'number') {
+            const inst = getInstance();
+            const buf = new Uint8Array(inst.exports.memory.buffer, msg >>> 0, arguments[1] >>> 0);
+            plv8.elog(NOTICE, new globalThis.TextDecoder('utf-8').decode(buf));
+            return;
+          }
+          plv8.elog(NOTICE, String(msg));
+        },
+        elog_error: function(msg) {
+          if (arguments.length >= 2 && typeof msg === 'number') {
+            const inst = getInstance();
+            const buf = new Uint8Array(inst.exports.memory.buffer, msg >>> 0, arguments[1] >>> 0);
+            throw new Error(new globalThis.TextDecoder('utf-8').decode(buf));
+          }
+          throw new Error(String(msg));
+        }
+      };
     };
 
     globalThis.postgres = {
@@ -549,7 +870,7 @@ BEGIN
 
   CREATE OR REPLACE FUNCTION public.plv8_wasm_handler()
   RETURNS language_handler AS $wasm_hdlr$
-    if (typeof globalThis.__plv8_wasm_polyfills_loaded === 'undefined') {
+    if (typeof globalThis.__plv8_wasm_polyfills_loaded === 'undefined' || typeof globalThis.__plv8_wasm_create_postgres !== 'function') {
       plv8.find_function('public.plv8_wasm_bootstrap_polyfills')();
     }
 
@@ -616,7 +937,8 @@ BEGIN
     let returnLength = 0;
     if (typeof config.return_length === 'number' && config.return_length > 0) {
       returnLength = config.return_length | 0;
-    } else if (meta && meta.rettype_category === 'U' && meta.rettype_len > 0) {
+    } else if ((config.return_mode === 'fixed' || config.return_mode === 'raw_ptr') &&
+               meta && meta.rettype_category === 'U' && meta.rettype_len > 0) {
       returnLength = meta.rettype_len | 0;
     }
 
@@ -662,7 +984,7 @@ BEGIN
     const callSpecLit = JSON.stringify(callSpec);
 
     return `
-      if (typeof globalThis.__plv8_wasm_polyfills_loaded === 'undefined') {
+      if (typeof globalThis.__plv8_wasm_polyfills_loaded === 'undefined' || typeof globalThis.__plv8_wasm_create_postgres !== 'function') {
         plv8.find_function('public.plv8_wasm_bootstrap_polyfills')();
       }
       if (!globalThis._wasm_modules) globalThis._wasm_modules = Object.create(null);
@@ -697,10 +1019,19 @@ BEGIN
         const mod = globalThis._wasm_modules[cacheKey];
 
         let instance = null;
+        const getInst = function() { return instance; };
+        const wasi = globalThis.__plv8_wasm_create_wasi(getInst);
+        const pgHost = globalThis.__plv8_wasm_create_postgres(getInst);
         const imports = {
+          wasi_snapshot_preview1: wasi,
+          wasi_unstable: wasi,
           env: {
             abort: function() {
               throw new Error('WASM execution aborted');
+            },
+            __wasi_fd_write: wasi.fd_write,
+            'syscall.seek': function() {
+              return 0;
             },
             plv8_elog_notice: function(ptr, len) {
               const buf = new Uint8Array(instance.exports.memory.buffer, ptr >>> 0, len >>> 0);
@@ -711,26 +1042,7 @@ BEGIN
               throw new Error(new globalThis.TextDecoder('utf-8').decode(buf));
             }
           },
-          postgres: {
-            spi_exec: function(sql) {
-              const replacer = function(_k, v) {
-                return typeof v === 'bigint' ? Number(v) : v;
-              };
-              if (typeof sql === 'string') {
-                return JSON.stringify(plv8.execute(sql), replacer);
-              }
-              const query = new globalThis.TextDecoder('utf-8').decode(
-                new Uint8Array(instance.exports.memory.buffer, sql >>> 0, arguments[1] >>> 0)
-              );
-              return JSON.stringify(plv8.execute(query), replacer);
-            },
-            elog_notice: function(msg) {
-              plv8.elog(NOTICE, String(msg));
-            },
-            elog_error: function(msg) {
-              throw new Error(String(msg));
-            }
-          }
+          postgres: pgHost
         };
 
         if (glueSource) {
@@ -745,6 +1057,9 @@ BEGIN
             }
           }
           instance = new WebAssembly.Instance(mod, imports);
+          if (typeof instance.exports._initialize === 'function') {
+            instance.exports._initialize();
+          }
           globalThis._wasm_instances[cacheKey] = instance;
           if (preGlue && typeof preGlue.__wbg_set_wasm === 'function') {
             preGlue.__wbg_set_wasm(instance.exports, instance);
@@ -754,6 +1069,9 @@ BEGIN
           }
         } else {
           instance = new WebAssembly.Instance(mod, imports);
+          if (typeof instance.exports._initialize === 'function') {
+            instance.exports._initialize();
+          }
           globalThis._wasm_instances[cacheKey] = instance;
         }
       }
@@ -771,10 +1089,12 @@ BEGIN
     `;
   $wasm_hdlr$ LANGUAGE plv8;
 
-    CREATE TRUSTED LANGUAGE "pl/v8-wasm"
-      HANDLER public.plv8_wasm_handler
-      INLINE plv8_inline_handler
-      VALIDATOR plv8_call_validator;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'pl/v8-wasm') THEN
+      CREATE TRUSTED LANGUAGE "pl/v8-wasm"
+        HANDLER public.plv8_wasm_handler
+        INLINE plv8_inline_handler
+        VALIDATOR plv8_call_validator;
+    END IF;
 
     REVOKE ALL ON FUNCTION public.plv8_wasm_handler() FROM PUBLIC;
     REVOKE ALL ON FUNCTION public.plv8_wasm_bootstrap_polyfills() FROM PUBLIC;
@@ -862,12 +1182,34 @@ BEGIN
   -- Ensure the shared pl/v8-wasm language and catalog table exist outside CREATE EXTENSION
   PERFORM pgtle.bootstrap_wasm_engine();
 
+  IF pg_catalog.to_regclass('plv8.packages') IS NOT NULL AND pg_catalog.to_regclass('plv8.modules') IS NOT NULL THEN
+    INSERT INTO plv8.packages (name, version, entry_point)
+    VALUES (install_wasm_extension.name, install_wasm_extension.version, 'index.wasm')
+    ON CONFLICT ON CONSTRAINT packages_pkey DO UPDATE SET entry_point = EXCLUDED.entry_point;
+
+    INSERT INTO plv8.modules (path, package_name, package_version, source, bytecode, is_trusted)
+    VALUES ('index.wasm', install_wasm_extension.name, install_wasm_extension.version, NULLIF(glue_js, ''), wasm_bytecode, true)
+    ON CONFLICT (package_name, package_version, path) WHERE package_name IS NOT NULL DO UPDATE SET
+      source = EXCLUDED.source,
+      bytecode = EXCLUDED.bytecode,
+      is_trusted = EXCLUDED.is_trusted;
+  END IF;
+
   hex_wasm := pg_catalog.encode(wasm_bytecode, 'hex');
 
   gen_sql := pg_catalog.format(
     $hdr$
 SELECT pgtle.bootstrap_wasm_engine();
 SELECT pgtle.install_module(%L, %L, %L, pg_catalog.decode(%L, 'hex'), NULL, true);
+INSERT INTO plv8.packages (name, version, entry_point)
+VALUES (%L, %L, 'index.wasm')
+ON CONFLICT (name, version) DO UPDATE SET entry_point = EXCLUDED.entry_point;
+INSERT INTO plv8.modules (path, package_name, package_version, source, bytecode, is_trusted)
+VALUES ('index.wasm', %L, %L, NULLIF(%L, ''), pg_catalog.decode(%L, 'hex'), true)
+ON CONFLICT (package_name, package_version, path) WHERE package_name IS NOT NULL DO UPDATE SET
+  source = EXCLUDED.source,
+  bytecode = EXCLUDED.bytecode,
+  is_trusted = EXCLUDED.is_trusted;
 INSERT INTO public.plv8_wasm_modules (module_name, wasm_bytecode, glue_js)
 VALUES (%L, pg_catalog.decode(%L, 'hex'), NULLIF(%L, ''))
 ON CONFLICT (module_name) DO UPDATE SET
@@ -875,6 +1217,8 @@ ON CONFLICT (module_name) DO UPDATE SET
   glue_js = EXCLUDED.glue_js,
   installed_at = clock_timestamp();
 $hdr$,
+    name, version, glue_js, hex_wasm,
+    name, version,
     name, version, glue_js, hex_wasm,
     name, hex_wasm, glue_js
   );
@@ -892,10 +1236,10 @@ $hdr$,
       t_len := COALESCE((t_elem->>'internallength')::int4, -1);
       t_align := COALESCE(NULLIF(t_elem->>'alignment', ''), 'int4');
       t_storage := COALESCE(NULLIF(t_elem->>'storage', ''), 'plain');
-      t_in_export := COALESCE(NULLIF(t_elem->>'input_export', ''), NULLIF(t_elem->>'input_func', ''), t_name || '_in');
-      t_out_export := COALESCE(NULLIF(t_elem->>'output_export', ''), NULLIF(t_elem->>'output_func', ''), t_name || '_out');
-      t_in_fn := COALESCE(NULLIF(t_elem->>'input_function', ''), NULLIF(t_elem->>'input_func', ''), t_name || '_in');
-      t_out_fn := COALESCE(NULLIF(t_elem->>'output_function', ''), NULLIF(t_elem->>'output_func', ''), t_name || '_out');
+      t_in_export := COALESCE(NULLIF(t_elem->>'input_export', ''), NULLIF(t_elem->>'input_func', ''), NULLIF(t_elem->>'input', ''), t_name || '_in');
+      t_out_export := COALESCE(NULLIF(t_elem->>'output_export', ''), NULLIF(t_elem->>'output_func', ''), NULLIF(t_elem->>'output', ''), t_name || '_out');
+      t_in_fn := COALESCE(NULLIF(t_elem->>'input_function', ''), t_name || '_in');
+      t_out_fn := COALESCE(NULLIF(t_elem->>'output_function', ''), t_name || '_out');
 
       t_in_cfg := jsonb_build_object(
         'module', name,
@@ -957,7 +1301,7 @@ $typ$,
             op_fn_name
           );
           op_nargs := COALESCE((op_elem->>'nargs')::int4, 2);
-          op_returns := COALESCE(NULLIF(op_elem->>'returns', ''), pg_catalog.format('%I.%I', t_schema, t_name));
+          op_returns := COALESCE(NULLIF(op_elem->>'returns', ''), NULLIF(op_elem->>'result', ''), pg_catalog.format('%I.%I', t_schema, t_name));
           op_sig_args := CASE WHEN op_nargs = 1 THEN 'bytea' ELSE 'bytea, bytea' END;
 
           op_cfg := jsonb_build_object(
@@ -1021,7 +1365,7 @@ $opfn$,
       END IF;
 
       f_export := COALESCE(NULLIF(f_elem->>'export', ''), NULLIF(f_elem->>'wasm_export', ''), f_name);
-      f_returns := COALESCE(NULLIF(f_elem->>'returns', ''), 'int4');
+      f_returns := COALESCE(NULLIF(f_elem->>'returns', ''), NULLIF(f_elem->>'result', ''), 'int4');
       f_vol := CASE pg_catalog.upper(COALESCE(f_elem->>'volatility', 'IMMUTABLE'))
         WHEN 'VOLATILE' THEN 'VOLATILE'
         WHEN 'STABLE' THEN 'STABLE'
@@ -1114,7 +1458,7 @@ $opfn$,
           ELSE 2
         END
       );
-      op_returns := COALESCE(NULLIF(op_elem->>'returns', ''), pg_catalog.format('%I.%I', t_schema, t_name));
+      op_returns := COALESCE(NULLIF(op_elem->>'returns', ''), NULLIF(op_elem->>'result', ''), pg_catalog.format('%I.%I', t_schema, t_name));
       op_sig_args := CASE WHEN op_nargs = 1 THEN 'bytea' ELSE 'bytea, bytea' END;
 
       IF op_elem ? 'export' OR op_elem ? 'wasm_export' THEN

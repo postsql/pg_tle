@@ -32,6 +32,8 @@ There are examples for writing TLEs in several languages, including:
 * [PL/pgSQL](./docs/06_plpgsql_examples.md)
 * [JavaScript](./docs/07_plv8_examples.md)
 * [Perl](./docs/08_plperl_examples.md)
+* [Rust (WebAssembly)](./docs/10_wasm_rust_examples.md)
+* [Go & TinyGo (WebAssembly)](./docs/11_wasm_go_tinygo_examples.md)
 
 ## Supported PostgreSQL versions
 

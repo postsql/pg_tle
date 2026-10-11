@@ -17,3 +17,9 @@ coverage/
 coverage-html-stamp
 .pgtle-*
 env.ini
+__pycache__/
+*.pyc
+tools/build/
+tools/dist/
+tools/*.egg-info/
+

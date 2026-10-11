@@ -19,9 +19,12 @@ import os
 import pathlib
 import posixpath
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+__version__ = "1.6.0"
 
 WASM_MAGIC = b"\x00asm\x01\x00\x00\x00"
 
@@ -32,18 +35,48 @@ WASM_VALTYPE_TO_PG: Dict[int, str] = {
     0x7C: "float8",  # f64
 }
 
-# Regex matching ES static imports/re-exports, dynamic import(), and CommonJS require():
+# Regex matching JS comments and string/template literals (ignored during import rewriting)
+# or ES static imports/re-exports, dynamic import(), and CommonJS require().
 # Captures the module specifier in group 'spec'.
 IMPORT_SPEC_RE = re.compile(
     r"""(?x)
+    (?P<comment>//[^\n]*|/\*[\s\S]*?\*/)
+    |
     (?:
-        \b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?
-      | \bimport\s*\(\s*
-      | \brequire\s*\(\s*
+        \bimport\s+(?:[A-Za-z0-9_$*,\s{}]*?\bfrom\s+)?
+      | \bexport\s+(?:\*(?:\s+as\s+[A-Za-z_$][A-Za-z0-9_$]*)?|\{[A-Za-z0-9_$,\s]*\})\s+from\s+
+      | \b(?:import|require)\s*\(\s*
     )
-    (?P<quote>['"])(?P<spec>[^'"]+)(?P=quote)
+    (?P<quote>['"])(?P<spec>[^'"\n]+)(?P=quote)
+    |
+    (?P<string>"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)
     """
 )
+
+
+def resolve_default_psql_bin() -> str:
+  """Resolves the default `psql` binary path in an environment-agnostic manner."""
+  env_psql = os.environ.get("TLE_PACK_PSQL")
+  if env_psql:
+    return env_psql
+  which_psql = shutil.which("psql")
+  if which_psql:
+    return which_psql
+  pg_config = os.environ.get("PG_CONFIG") or shutil.which("pg_config")
+  if pg_config:
+    try:
+      res = subprocess.run(
+          [pg_config, "--bindir"],
+          capture_output=True,
+          text=True,
+          check=True,
+      )
+      candidate = pathlib.Path(res.stdout.strip()) / "psql"
+      if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    except Exception:
+      pass
+  return "psql"
 
 
 def normalize_pkg_name(raw_name: str) -> str:
@@ -199,6 +232,8 @@ def collect_js_module_graph(
     deps: List[str] = []
 
     def rewrite_spec(match: re.Match[str]) -> str:
+      if match.group("comment") is not None or match.group("string") is not None:
+        return match.group(0)
       full = match.group(0)
       quote = match.group("quote")
       spec = match.group("spec")
@@ -253,6 +288,12 @@ def compile_bytecode_via_psql(
   """Pre-compiles JS modules into QuickJS (`pljs`) or V8 (`plv8`) bytecode via PostgreSQL."""
   if engine not in ("plv8", "pljs"):
     raise ValueError(f"Unsupported bytecode engine: {engine}")
+
+  if not pathlib.Path(psql_bin).is_file() and not shutil.which(psql_bin):
+    raise FileNotFoundError(
+        f"PostgreSQL client binary '{psql_bin}' not found. "
+        "Ensure 'psql' is on PATH or pass --psql-bin / TLE_PACK_PSQL."
+    )
 
   helper_fn = f"__tle_pack_compile_{engine}_bc"
   ext_name = engine
@@ -395,6 +436,9 @@ def introspect_wasm_binary(wasm_bytes: bytes) -> Dict[str, Any]:
           p = skip_wasm_limits(wasm_bytes, p)
         elif kind == 0x03:  # global import
           p += 2  # valtype + mutability
+        elif kind == 0x04:  # tag import (exception handling proposal)
+          p += 1  # attribute byte (0x00)
+          _, p = read_uleb128(wasm_bytes, p)
         else:
           break
 
@@ -419,13 +463,40 @@ def introspect_wasm_binary(wasm_bytes: bytes) -> Dict[str, Any]:
   inferred_functions: List[Dict[str, Any]] = []
   has_memory = False
 
+  internal_exports = {
+      "_initialize",
+      "_start",
+      "_cgo_dummy_export",
+      "alloc",
+      "dealloc",
+      "malloc",
+      "free",
+      "calloc",
+      "realloc",
+      "stackSave",
+      "stackRestore",
+      "stackAlloc",
+      "fminimum",
+      "fminimumf",
+      "fmaximum",
+      "fmaximumf",
+      "rust_eh_personality",
+  }
+
   for exp in exports:
-    if exp["kind"] == 0x02 and exp["name"] == "memory":
+    if exp["kind"] == 0x02:
       has_memory = True
     elif exp["kind"] == 0x00:  # Function export
       fn_idx = exp["index"]
       exp_name = exp["name"]
-      if exp_name.startswith("__"):
+      if (
+          exp_name.startswith("__")
+          or exp_name.startswith("asyncify_")
+          or exp_name.startswith("_dyn_")
+          or exp_name.startswith("wasm_bindgen__")
+          or exp_name in internal_exports
+          or "." in exp_name
+      ):
         continue
       if fn_idx >= len(all_func_type_indices):
         continue
@@ -478,7 +549,7 @@ def merge_wasm_manifest(
   used_exports: Set[str] = set()
 
   for t in merged_types:
-    for key in ("input_export", "input_func", "output_export", "output_func"):
+    for key in ("input_export", "input_func", "input", "output_export", "output_func", "output"):
       if t.get(key):
         used_exports.add(t[key])
     for op in t.get("operators", []):
@@ -506,7 +577,7 @@ def merge_wasm_manifest(
       inf = inferred_by_export[exp_name]
       if "args" not in f_copy:
         f_copy["args"] = inf["args"]
-      if "returns" not in f_copy:
+      if "returns" not in f_copy and "result" not in f_copy:
         f_copy["returns"] = inf["returns"]
     merged_funcs.append(f_copy)
 
@@ -524,6 +595,8 @@ def merge_wasm_manifest(
   }
   if "operators" in user_manifest:
     res["operators"] = list(user_manifest["operators"])
+  if "glue_js" in user_manifest:
+    res["glue_js"] = user_manifest["glue_js"]
   return res
 
 
@@ -608,7 +681,7 @@ def generate_js_bundle_sql(
   # declared in package.json -> "pgtle": {"functions": [...]}
   pgtle_cfg = pkg_meta.get("pgtle", {}) if isinstance(pkg_meta, dict) else {}
   exported_sql_funcs = pgtle_cfg.get("functions", [])
-  if as_extension or exported_sql_funcs:
+  if as_extension or create_extension or exported_sql_funcs:
     ext_stmts: List[str] = []
     for fn_spec in exported_sql_funcs:
       sql_fn_name = fn_spec.get("name") or fn_spec.get("sql_name")
@@ -718,6 +791,63 @@ def generate_wasm_bundle_sql(
   return "\n".join(out)
 
 
+def transform_wasm_bindgen_glue(raw_js: str, exported_fn_names: List[str]) -> str:
+  """Transforms `wasm-bindgen --target web` ES module glue into a synchronous PLV8 factory body."""
+  if "__wbg_get_imports:" in raw_js and "__wbg_set_wasm:" in raw_js:
+    return raw_js
+  js = raw_js
+  discovered_exports = set(exported_fn_names)
+  for m in re.finditer(r"^\s*export\s+function\s+([A-Za-z0-9_$]+)", js, flags=re.MULTILINE):
+    discovered_exports.add(m.group(1))
+  for m in re.finditer(r"^\s*export\s*\{([^}]*)\}\s*;?\s*$", js, flags=re.MULTILINE):
+    for item in m.group(1).split(","):
+      parts = [p.strip() for p in item.strip().split(" as ") if p.strip()]
+      if parts:
+        local_name = parts[0]
+        export_alias = parts[-1]
+        if export_alias not in ("default", "initSync", "__wbg_init"):
+          discovered_exports.add(local_name)
+
+  js = re.sub(r"^\s*export\s+default\s+[^;]+;\s*$", "", js, flags=re.MULTILINE)
+  js = re.sub(r"^\s*export\s*\{[^}]*\}\s*;?\s*$", "", js, flags=re.MULTILINE)
+  js = js.replace("import.meta.url", '""')
+  js = re.sub(r"\bimport\.meta\b", "({})", js)
+  js = re.sub(
+      r"^(\s*)export\s+(function|class|const|let|var)\s+",
+      r"\1\2 ",
+      js,
+      flags=re.MULTILINE,
+  )
+  exports_entries = [
+      f"{name}: (typeof {name} !== 'undefined') ? {name} : function() {{ return wasm[{name!r}].apply(wasm, arguments); }}"
+      for name in sorted(discovered_exports)
+  ]
+  exports_map = ", ".join(exports_entries)
+  footer = f"""
+return {{
+  __wbg_get_imports: (typeof __wbg_get_imports === 'function')
+    ? __wbg_get_imports
+    : function() {{ return {{}}; }},
+  __wbg_set_wasm: function(exportsObj, instanceObj) {{
+    if (typeof __wbg_finalize_init === 'function' && instanceObj) {{
+      __wbg_finalize_init(instanceObj);
+    }} else {{
+      wasm = exportsObj;
+      if (typeof cachedDataViewMemory0 !== 'undefined') cachedDataViewMemory0 = null;
+      if (typeof cachedUint8ArrayMemory0 !== 'undefined') cachedUint8ArrayMemory0 = null;
+      if (typeof cachedInt32Memory0 !== 'undefined') cachedInt32Memory0 = null;
+      if (typeof cachedUint8Memory0 !== 'undefined') cachedUint8Memory0 = null;
+      if (typeof wasm.__wbindgen_start === 'function') {{
+        wasm.__wbindgen_start();
+      }}
+    }}
+  }},
+  exports: {{ {exports_map} }}
+}};
+"""
+  return js + "\n" + footer
+
+
 # ==============================================================================
 # CLI Entrypoint
 # ==============================================================================
@@ -771,10 +901,13 @@ def pack_wasm_target(args: argparse.Namespace) -> str:
     if sibling.is_file() and not args.ignore_sibling_manifest:
       user_manifest = json.loads(sibling.read_text(encoding="utf-8"))
 
+  wasm_stem = wasm_path.stem
+  if wasm_stem.endswith("_bg") and len(wasm_stem) > 3:
+    wasm_stem = wasm_stem[:-3]
   ext_name = (
       args.name
       or (user_manifest.get("name") if user_manifest else None)
-      or wasm_path.stem.replace("-", "_")
+      or wasm_stem.replace("-", "_")
   )
   version = (
       args.version
@@ -793,6 +926,16 @@ def pack_wasm_target(args: argparse.Namespace) -> str:
       auto_discover_unlisted=args.auto_discover_exports,
       fn_prefix=args.function_prefix or "",
   )
+
+  if getattr(args, "glue_js", None):
+    glue_path = pathlib.Path(args.glue_js)
+    raw_glue = glue_path.read_text(encoding="utf-8")
+    exp_names = [
+        f.get("export") or f.get("wasm_export") or f.get("name")
+        for f in merged_manifest.get("functions", [])
+        if f.get("export") or f.get("wasm_export") or f.get("name")
+    ]
+    merged_manifest["glue_js"] = transform_wasm_bindgen_glue(raw_glue, exp_names)
 
   return generate_wasm_bundle_sql(
       ext_name=ext_name,
@@ -813,19 +956,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
       ),
   )
   parser.add_argument(
+      "-V",
+      "--tool-version",
+      action="version",
+      version=f"%(prog)s {__version__}",
+      help="Print the tle-pack tool version and exit.",
+  )
+  parser.add_argument(
       "mode",
       nargs="?",
-      choices=["auto", "js", "wasm"],
       default="auto",
       help="Packaging mode: 'js', 'wasm', or 'auto' (inferred from input path).",
   )
   parser.add_argument(
       "input",
+      nargs="?",
       help="Path to an npm package directory, .js/.mjs entry file, or .wasm binary.",
+  )
+  parser.add_argument(
+      "--wasm",
+      dest="wasm_input",
+      help="Path to .wasm binary (optional flag alias for positional input in wasm mode).",
+  )
+  parser.add_argument(
+      "--glue-js",
+      "--js",
+      dest="glue_js",
+      help="Optional path to wasm-bindgen JS glue file to bundle with the WASM binary.",
   )
   parser.add_argument(
       "-o",
       "--output",
+      "--out",
+      dest="output",
       help="Output .sql file path (defaults to stdout).",
   )
   parser.add_argument(
@@ -861,11 +1024,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument(
       "--psql-bin",
-      default=os.environ.get(
-          "TLE_PACK_PSQL",
-          "/usr/local/google/home/hannuk/pg19_install/bin/psql",
-      ),
-      help="Path to psql binary for --compile-bytecode with --dsn.",
+      default=resolve_default_psql_bin(),
+      help="Path to psql binary for --compile-bytecode with --dsn (default: $TLE_PACK_PSQL or psql on PATH).",
   )
   parser.add_argument(
       "--untrusted",
@@ -906,22 +1066,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-  # Support both `tle-pack <input> [flags]` and `tle-pack <js|wasm> <input> [flags]`
+  # Support both `tle-pack <input> [flags]`, `tle-pack [flags] <input>`,
+  # and `tle-pack <js|wasm> <input> [flags]`
   raw_args = list(sys.argv[1:] if argv is None else argv)
-  if (
-      raw_args
-      and not raw_args[0].startswith("-")
-      and raw_args[0] not in ("auto", "js", "wasm")
-  ):
-    raw_args = ["auto"] + raw_args
+  if raw_args in (["--version"], ["-V"], ["--tool-version"]):
+    print(f"tle-pack {__version__}")
+    return 0
 
   parser = build_arg_parser()
   args = parser.parse_args(raw_args)
 
+  if args.mode not in ("auto", "js", "wasm"):
+    if args.input is not None:
+      parser.error(
+          f"argument mode: invalid choice: {args.mode!r} (choose from 'auto', 'js', 'wasm')"
+      )
+    args.input = args.mode
+    args.mode = "auto"
+
+  if not args.input and getattr(args, "wasm_input", None):
+    args.input = args.wasm_input
+  if not args.input:
+    parser.error("the following arguments are required: input (or --wasm)")
+
   in_path = pathlib.Path(args.input)
   mode = args.mode
   if mode == "auto":
-    if in_path.suffix == ".wasm":
+    if in_path.suffix == ".wasm" or getattr(args, "wasm_input", None):
       mode = "wasm"
     else:
       mode = "js"
@@ -931,7 +1102,7 @@ def main(argv: Optional[List[str]] = None) -> int:
   else:
     sql_out = pack_js_target(args)
 
-  if args.output:
+  if args.output and args.output != "-":
     out_path = pathlib.Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(sql_out, encoding="utf-8")

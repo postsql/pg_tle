@@ -1,0 +1,13 @@
+include LICENSE
+include README.md
+include Makefile
+include pyproject.toml
+include setup.py
+include build_dist.py
+include install.sh
+include tle-pack
+include pgwasm-pack
+include pgwasm_pack.py
+recursive-include pgtle_tools *.py
+recursive-include pg_tle_manage_local_extension *.sh *.md
+recursive-include tests *.py
