@@ -41,7 +41,6 @@
 
 
 /* Local functions */
-static void check_is_pgtle_admin(void);
 static bool create_shell_type(Oid typeNamespace, const char *typeName, bool if_not_exists);
 static Oid	create_c_func_internal(Oid namespaceId, Oid funcid,
 								   oidvector *parameterTypes, Oid prorettype, char *prosrc,
@@ -66,15 +65,6 @@ static Datum
 											 char *alignmentStr,
 											 char *storageStr,
 											 char *funcProbin);
-
-static void
-check_is_pgtle_admin(void)
-{
-	Oid			tleadminoid;
-
-	tleadminoid = get_role_oid(PG_TLE_ADMIN, false);
-	CHECK_CAN_SET_ROLE(GetUserId(), tleadminoid);
-}
 
 /*
  *

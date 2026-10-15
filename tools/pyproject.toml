@@ -1,0 +1,54 @@
+[build-system]
+requires = []
+build-backend = "build_dist"
+backend-path = ["."]
+
+[project]
+name = "pgtle-tools"
+version = "1.6.0"
+description = "Standalone out-of-database CLI packaging & bundling tools (tle-pack and pgwasm-pack) for PostgreSQL pg_tle JS/npm modules and Rust/Go/TinyGo WebAssembly extensions."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+authors = [
+  {name = "pg_tle Contributors"}
+]
+keywords = [
+  "postgresql",
+  "pg_tle",
+  "plv8",
+  "pljs",
+  "webassembly",
+  "wasm",
+  "rust",
+  "golang",
+  "tinygo",
+  "wasm-bindgen",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = []
+
+[project.scripts]
+tle-pack = "pgtle_tools.tle_pack:main"
+pgwasm-pack = "pgtle_tools.pgwasm_pack:main"
+pgwasm_pack = "pgtle_tools.pgwasm_pack:main"
+
+[tool.setuptools]
+packages = ["pgtle_tools"]
+include-package-data = true

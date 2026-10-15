@@ -60,5 +60,6 @@ extern ObjectAddress tleAlterExtensionNamespace(const char *extensionName,
 
 void		pg_tle_init(void);
 void		pg_tle_fini(void);
+extern void check_is_pgtle_admin(void);
 
 #endif							/* TLEEXTENSION_H */
